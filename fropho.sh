@@ -1,31 +1,6 @@
 #!/bin/bash
 
-function run_calc {
-
-	calc_name=$1
-
-	if [ $cluster -eq 1 ]; then
-		if [ $brutus -eq 1 ]; then
-			cat > $calc_name.job << EOF
-#!/bin/bash
-#BSUB -n $cpus
-#BSUB -R "rusage[mem=1024]"
-#BSUB -W $walltime
-#BSUB -o %J.o
-#BSUB -e %J.e
-#BSUB -J $calc_name
-
-mpirun vasp-5.2.11 > log
-EOF
-			bsub < $calc_name.job
-		fi
-	else
-		echo "Running vasp on $cpus cpus for $calc_name"
-		mpirun -np $cpus vasp | tee -a log
-	fi
-}
-
-USAGE="Usage: `basename $0` [-hv] [-d 'dima dimb dimc'] [-q 'qa qb qc'] [-m mode] [-i min] [-a max] [-s step] [-c cpus] [-w walltime]"
+USAGE="Usage: `basename $0` [-hv] [-d 'dima dimb dimc'] [-q 'qa qb qc'] [-m mode] [-i min] [-a max] [-s step] [-c cpus] [-w walltime] -f"
 
 #set defaults
 mode=-1
@@ -38,18 +13,50 @@ dim_c=-1
 q_a=-1
 q_b=-1
 q_c=-1
-cpus=12
+cpus=1
 walltime="1:00"
+wavefunction=0
 
-# Parse command line options.
-while getopts hvm:i:a:s:d:q:c:w: OPT; do
+#check if the computer config directory exists, otherwise create it and put a default file there
+if [ ! -d $HOME/.fropho/computers ]; then
+	mkdir -p $HOME/.fropho/computers
+	cat > $HOME/.fropho/computers/default.conf << EOF
+#HOSTNAME *
+#DEFAULT_CPUS 1
+#DEFAULT_WALLTIME 1:00:00
+function run_calc {
+	calc_name=$1
+	echo "Running vasp on $cpus cpus for $calc_name"
+	mpirun -np $cpus vasp | tee -a log
+}
+EOF
+fi
+
+#check if there is a computer config file for this machine
+machinefile=""
+for i in $HOME/.fropho/computers/*; do
+	hostname_mask=$(grep HOSTNAME $i | awk '{print $2}')
+	if [[ $(hostname) == $hostname_mask ]]; then
+		machinefile=$i
+		break
+	fi
+done
+if [ "$machinefile" == "" ]; then
+	echo "Did not find a matching machine file. Will try to use mpirun directly..."
+else
+	cpus=$(grep DEFAULT_CPUS $machinefile | awk '{print $2}')
+	walltime=$(grep DEFAULT_WALLTIME $machinefile | awk '{print $2}')
+fi
+
+# Parse command line options. These can override the machinefile values
+while getopts hvm:i:a:s:d:q:c:w:f OPT; do
     case "$OPT" in
         h)
             echo $USAGE
             exit 0
             ;;
         v)
-            echo "`basename $0` version 0.1"
+            echo "`basename $0` version 0.2"
             exit 0
             ;;
         m)
@@ -87,8 +94,8 @@ while getopts hvm:i:a:s:d:q:c:w: OPT; do
                 q_b=0.5
                 q_c=0.5
         else
-		q_a=$(echo "$OPTARG" | awk '{print $1}')
-		q_b=$(echo "$OPTARG" | awk '{print $2}')
+			q_a=$(echo "$OPTARG" | awk '{print $1}')
+			q_b=$(echo "$OPTARG" | awk '{print $2}')
 	    	q_c=$(echo "$OPTARG" | awk '{print $3}')
 	    fi
 	    ;;
@@ -98,6 +105,9 @@ while getopts hvm:i:a:s:d:q:c:w: OPT; do
 	w)
 	    walltime=$OPTARG
 	    ;;
+	f)
+		wavefunction=1
+		;;
     \?)
 		# getopts issues an error message
         echo $USAGE >&2
@@ -109,14 +119,8 @@ done
 # Remove the switches we parsed above.
 shift `expr $OPTIND - 1`
 
-#see if we are on a cluster or not
-#ATTENTION: this needs to be amended for every new cluster
-cluster=0
-brutus=0
-if [[ $(hostname) == brutus* ]]; then
-	cluster=1
-	brutus=1
-fi
+#include the run function from the computer config file
+source $machinefile
 
 #make sure at least dimensions are set and are integers
 if [ $dim_a -eq -1 ] || [ $dim_b -eq -1 ] || [ $dim_c -eq -1 ]; then
@@ -156,14 +160,7 @@ if [ $q_a != -1 ] && [ $q_b != -1 ] && [ $q_c != -1 ]; then
 else
 	echo "*** Insufficient input for visualization"
 fi
-echo "Number of CPUs:                            $cpus"
-if [ $cluster -eq 1 ]; then
-	if [ $brutus -eq 1 ]; then
-		echo "Running on brutus with walltime:           $walltime"
-	fi
-else
-	echo "Running locally without walltime limit"
-fi
+echo "Running calculations as specified in $machinefile with $cpus CPUs for $walltime"
 echo "**********************************************************************************"
 echo ""
 
@@ -183,7 +180,7 @@ if [ ! -f INCAR ] || [ ! -f KPOINTS ] || [ ! -f POSCAR ] || [ ! -f POTCAR ]; the
 fi
 
 
-#TODO should run some sanity checks on the files here
+#TODO should run some sanity checks on the file content here
 
 
 #move everything into dim_da_db_dc directories
@@ -243,7 +240,7 @@ if [ ! -d ground_state ] || [ ! -f ground_state/log ]; then
 	echo "Performing ground state calculation"
 	run_calc "ground_state"
 	echo ""
-	if [ $cluster -eq 1 ]; then
+	if [ $machinefile != "" ]; then
 		echo "$(basename $0) will exit. Rerun once ground-state calculation is done to continue"
 		exit
 	fi
@@ -290,7 +287,7 @@ else
 		fi
 	fi
 fi
-if [ $gs_run -eq 0 ] && [ $cluster -eq 1 ]; then
+if [ $gs_run -eq 0 ] && [ $machinefile != "" ]; then
 	echo "There was a problem with your ground state calculation. Please rerun when fixed."
 	exit
 fi
@@ -322,7 +319,9 @@ for poscar in $(ls POSCAR-*); do
 
 		mkdir $directoryname
 		cp INCAR KPOINTS POTCAR $directoryname/
-		ln -s ../ground_state/WAVECAR $directoryname/WAVECAR
+		if [ $wavefunction -eq 1 ]; then
+			ln -s ../ground_state/WAVECAR $directoryname/WAVECAR
+		fi
 		cp $poscar $directoryname/POSCAR
 		
 		cd $directoryname
@@ -332,7 +331,7 @@ for poscar in $(ls POSCAR-*); do
 	fi
 done
 #if on a cluster exit here to let them run
-if [ $did_one -ne 0 ] && [ $cluster -eq 1 ]; then
+if [ $did_one -ne 0 ] && [ $machinefile != "" ]; then
 	echo "$(basename $0) will exit. Rerun when calculations are done to continue"
 	exit
 fi
@@ -385,7 +384,7 @@ for i in $(ls -d displ_*); do
 	fi
 
 done
-if [ ! $all_good -eq 1 ] && [ $cluster -eq 1 ]; then
+if [ ! $all_good -eq 1 ] && [ $machinefile != "" ]; then
 	echo "There was a problem with some of the displacements. Please rerun when corrected"
 	exit
 fi
@@ -494,7 +493,7 @@ if [ ! $mode -eq -1 ]; then
 		fi
 	
 		#if on a cluster exit here to let them run
-		if [ $did_one -ne 0 ] && [ $cluster -eq 1 ]; then
+		if [ $did_one -ne 0 ] && [ $machinefile != "" ]; then
 		        echo "$(basename $0) will exit. Rerun when calculations are done to continue"
        		 	exit
 		fi
@@ -549,7 +548,7 @@ if [ ! $mode -eq -1 ]; then
 		fi
 
 	done
-	if [ ! $all_good -eq 1 ] && [ $cluster -eq 1 ]; then
+	if [ ! $all_good -eq 1 ] && [ $machinefile != "" ]; then
 		echo "There was a problem with some of the modulation amplitudes. Please rerun when corrected"
 		exit
 	fi
